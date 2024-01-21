@@ -31,7 +31,14 @@
 //!     type Item = u32;
 //!     type Results = [u32; 16];
 //!
-//!     fn generate(&mut self, results: &mut Self::Results) {
+//!     const BLOCK_SIZE: usize = 512;
+//!     const MAX_BLOCKS: usize = 1;
+//!     
+//!     fn get_buffer_size() -> usize {
+//!         16
+//!     }
+//!
+//!     unsafe fn generate(&mut self, dest_ptr: *mut u8, num_blocks: usize) {
 //!         unimplemented!()
 //!     }
 //! }
@@ -54,11 +61,11 @@
 //! [`fill_bytes`]: RngCore::fill_bytes
 
 use crate::impls::{fill_via_u32_chunks, fill_via_u64_chunks};
-use crate::{Error, CryptoRng, RngCore, SeedableRng};
+use crate::{CryptoRng, Error, RngCore, SeedableRng};
 use core::convert::AsRef;
 use core::fmt;
-#[cfg(feature = "serde1")]
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "serde1")] use serde::{Deserialize, Serialize};
+#[cfg(feature = "zeroize")] use zeroize::Zeroize;
 
 /// A trait for RNGs which do not generate random numbers individually, but in
 /// blocks (typically `[u32; N]`). This technique is commonly used by
@@ -68,20 +75,43 @@ use serde::{Deserialize, Serialize};
 pub trait BlockRngCore {
     /// Results element type, e.g. `u32`.
     type Item;
+    /// The minimum blocksize for the BlockRng in bytes
+    const BLOCK_SIZE: usize;
 
+    /// A function to help determine the optimal buffer size at runtime.
+    /// If there is only one size, it can just return that size. Measured
+    /// in items
+    fn get_buffer_size() -> usize;
+
+    /// A function to determine how many blocks fit in the buffer
+    fn get_buf_blocks() -> usize {
+        
+    }
+
+    #[cfg(not(feature = "zeroize"))]
     /// Results type. This is the 'block' an RNG implementing `BlockRngCore`
     /// generates, which will usually be an array like `[u32; 16]`.
     type Results: AsRef<[Self::Item]> + AsMut<[Self::Item]> + Default;
+    #[cfg(feature = "zeroize")]
+    /// Results type. This is the 'block' an RNG implementing `BlockRngCore`
+    /// generates, which will usually be an array like `[u32; 16]`.
+    type Results: AsRef<[Self::Item]> + AsMut<[Self::Item]> + Default + Zeroize;
 
-    /// Generate a new block of results.
-    fn generate(&mut self, results: &mut Self::Results);
+    /// A pointer to the results type
+    fn get_results_mut_ptr(&mut self, results: &mut Self::Results) -> *mut u8 {
+        results.as_mut().as_mut_ptr() as *mut u8
+    }
+
+    /// Generate `num_blocks` blocks of results, and blindly writes them
+    /// to the `dest_ptr`
+    unsafe fn generate(&mut self, dest_ptr: *mut u8, num_blocks: usize);
 }
 
 /// A marker trait used to indicate that an [`RngCore`] implementation is
 /// supposed to be cryptographically secure.
 ///
 /// See [`CryptoRng`][crate::CryptoRng] docs for more information.
-pub trait CryptoBlockRng: BlockRngCore { }
+pub trait CryptoBlockRng: BlockRngCore {}
 
 /// A wrapper type implementing [`RngCore`] for some type implementing
 /// [`BlockRngCore`] with `u32` array buffer; i.e. this can be used to implement
@@ -178,8 +208,12 @@ impl<R: BlockRngCore> BlockRng<R> {
     /// given value.
     #[inline]
     pub fn generate_and_set(&mut self, index: usize) {
-        assert!(index < self.results.as_ref().len());
-        self.core.generate(&mut self.results);
+        assert!(index < R::get_buffer_size());
+        let results_ptr = self.core.get_results_mut_ptr(&mut self.results);
+        let num_blocks = R::get_buf_blocks();
+        unsafe {
+            self.core.generate(results_ptr, num_blocks);
+        }
         self.index = index;
     }
 }
@@ -223,17 +257,53 @@ impl<R: BlockRngCore<Item = u32>> RngCore for BlockRng<R> {
 
     #[inline]
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        let mut read_len = 0;
-        while read_len < dest.len() {
-            if self.index >= self.results.as_ref().len() {
-                self.generate_and_set(0);
-            }
-            let (consumed_u32, filled_u8) =
-                fill_via_u32_chunks(&mut self.results.as_mut()[self.index..], &mut dest[read_len..]);
+        let dest_len = dest.len();
+        // calculate the remaining bytes to fill from `self.buffer`,
+        // when indexed by `u32`s
+        let buffer_size = <R as BlockRngCore>::get_buffer_size();
+        let remaining_bytes = ((buffer_size << 2) - (self.index << 2)).min(dest_len);
 
-            self.index += consumed_u32;
-            read_len += filled_u8;
+        let mut dest_pos = 0;
+        if remaining_bytes != 0 {
+            // fills with as many bytes from the currently generated buffer as necessary
+            if self.index < buffer_size {
+                let (consumed_u32, filled_u8) =
+                    fill_via_u32_chunks(&mut self.results.as_mut()[self.index..buffer_size], &mut dest[0..]);
+                self.index += consumed_u32;
+                dest_pos += filled_u8;
+
+                if dest_len == dest_pos {
+                    return;
+                }
+            }
         }
+
+        let remaining_blocks = (dest_len - dest_pos) / R::BLOCK_SIZE;
+
+        // SAFETY: This only writes to indices that have not yet been written
+        // to, and we have determined how many blocks are remaining.
+        unsafe {
+            let mut chunk_ptr = dest.as_mut_ptr();
+            chunk_ptr = chunk_ptr.add(dest_pos);
+            self.core.generate(chunk_ptr, remaining_blocks);
+        }
+
+        dest_pos += R::BLOCK_SIZE * remaining_blocks;
+
+        // index is still at the maximum value, so there's no need to
+        // to generate bytes to the buffer yet
+        if dest_pos == dest_len {
+            // dest has been filled
+            return;
+        }
+        // refill buffer before filling the tail
+        self.generate_and_set(0);
+
+        let (consumed_u32, _filled_u8) = fill_via_u32_chunks(
+            &mut self.results.as_mut()[self.index..],
+            &mut dest[dest_pos..],
+        );
+        self.index = consumed_u32;
     }
 
     #[inline(always)]
@@ -345,7 +415,11 @@ impl<R: BlockRngCore> BlockRng64<R> {
     #[inline]
     pub fn generate_and_set(&mut self, index: usize) {
         assert!(index < self.results.as_ref().len());
-        self.core.generate(&mut self.results);
+        let results_ptr = self.core.get_results_mut_ptr(&mut self.results);
+        unsafe {
+            self.core
+                .generate(results_ptr, R::get_buf_blocks());
+        }
         self.index = index;
         self.half_used = false;
     }
@@ -356,7 +430,10 @@ impl<R: BlockRngCore<Item = u64>> RngCore for BlockRng64<R> {
     fn next_u32(&mut self) -> u32 {
         let mut index = self.index - self.half_used as usize;
         if index >= self.results.as_ref().len() {
-            self.core.generate(&mut self.results);
+            let results_ptr = self.core.get_results_mut_ptr(&mut self.results);
+            unsafe {
+                self.core.generate(results_ptr, 1);
+            }
             self.index = 0;
             index = 0;
             // `self.half_used` is by definition `false`
@@ -374,7 +451,10 @@ impl<R: BlockRngCore<Item = u64>> RngCore for BlockRng64<R> {
     #[inline]
     fn next_u64(&mut self) -> u64 {
         if self.index >= self.results.as_ref().len() {
-            self.core.generate(&mut self.results);
+            let results_ptr = self.core.get_results_mut_ptr(&mut self.results);
+            unsafe {
+                self.core.generate(results_ptr, 1);
+            }
             self.index = 0;
         }
 
@@ -390,7 +470,10 @@ impl<R: BlockRngCore<Item = u64>> RngCore for BlockRng64<R> {
         self.half_used = false;
         while read_len < dest.len() {
             if self.index >= self.results.as_ref().len() {
-                self.core.generate(&mut self.results);
+                let results_ptr = self.core.get_results_mut_ptr(&mut self.results);
+                unsafe {
+                    self.core.generate(results_ptr, 1);
+                }
                 self.index = 0;
             }
 
@@ -434,8 +517,8 @@ impl<R: CryptoBlockRng + BlockRngCore<Item = u64>> CryptoRng for BlockRng64<R> {
 
 #[cfg(test)]
 mod test {
-    use crate::{SeedableRng, RngCore};
     use crate::block::{BlockRng, BlockRng64, BlockRngCore};
+    use crate::{RngCore, SeedableRng};
 
     #[derive(Debug, Clone)]
     struct DummyRng {
@@ -444,13 +527,23 @@ mod test {
 
     impl BlockRngCore for DummyRng {
         type Item = u32;
-
         type Results = [u32; 16];
 
-        fn generate(&mut self, results: &mut Self::Results) {
-            for r in results {
-                *r = self.counter;
-                self.counter = self.counter.wrapping_add(3511615421);
+        const BLOCK_SIZE: usize = 512;
+        const MAX_BLOCKS: usize = 1;
+
+        fn get_buffer_size() -> usize {
+            16
+        }
+
+        unsafe fn generate(&mut self, dest_ptr: *mut u8, num_blocks: usize) {
+            let mut dest_ptr = dest_ptr as *mut u32;
+            for _i in 0..num_blocks {
+                for _word_32 in 0..Self::BLOCK_SIZE / 32 {
+                    *dest_ptr = self.counter;
+                    self.counter = self.counter.wrapping_add(3511615421);
+                    dest_ptr = dest_ptr.add(1);
+                }
             }
         }
     }
@@ -459,7 +552,9 @@ mod test {
         type Seed = [u8; 4];
 
         fn from_seed(seed: Self::Seed) -> Self {
-            DummyRng { counter: u32::from_le_bytes(seed) }
+            DummyRng {
+                counter: u32::from_le_bytes(seed),
+            }
         }
     }
 
@@ -494,13 +589,23 @@ mod test {
 
     impl BlockRngCore for DummyRng64 {
         type Item = u64;
-
         type Results = [u64; 8];
 
-        fn generate(&mut self, results: &mut Self::Results) {
-            for r in results {
-                *r = self.counter;
-                self.counter = self.counter.wrapping_add(2781463553396133981);
+        const BLOCK_SIZE: usize = 512;
+        const MAX_BLOCKS: usize = 1;
+
+        fn get_buffer_size() -> usize {
+            8
+        }
+
+        unsafe fn generate(&mut self, dest_ptr: *mut u8, num_blocks: usize) {
+            let mut dest_ptr = dest_ptr as *mut u64;
+            for _i in 0..num_blocks {
+                for _word_64 in 0..Self::BLOCK_SIZE / 64 {
+                    *dest_ptr = self.counter.to_le();
+                    self.counter = self.counter.wrapping_add(2781463553396133981);
+                    dest_ptr = dest_ptr.add(1);
+                }
             }
         }
     }
@@ -509,7 +614,9 @@ mod test {
         type Seed = [u8; 8];
 
         fn from_seed(seed: Self::Seed) -> Self {
-            DummyRng64 { counter: u64::from_le_bytes(seed) }
+            DummyRng64 {
+                counter: u64::from_le_bytes(seed),
+            }
         }
     }
 
